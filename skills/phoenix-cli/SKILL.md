@@ -40,6 +40,7 @@ px session delete <session-id>
 px session-annotations delete
 px dataset list
 px dataset get <name>
+px dataset upload <file> --name <name> --input-keys <columns...>
 px dataset-versions list <dataset-identifier>
 px dataset delete <dataset-identifier>
 px experiment list
@@ -387,6 +388,7 @@ px dataset list --format raw --no-progress | jq '.[].name'
 px dataset get <name> --format raw | jq '.examples[] | {input, output: .expected_output}'
 px dataset get <name> --split train --format raw | jq .    # filter by split
 px dataset get <name> --version <version-id> --format raw | jq .
+px dataset upload rows.jsonl --name <name> --input-keys question --format raw --no-progress | jq .dataset_id
 px dataset-versions list <name-or-id> --format raw --no-progress | jq '.[].version_id'
 px experiment list --dataset <name> --format raw --no-progress | jq '.[] | {id, name, failed_run_count}'
 px experiment get <id> --format raw --no-progress | jq '.[] | select(.error != null) | {input, error}'

@@ -449,6 +449,22 @@ Use `px dataset-versions list <dataset-identifier>` to discover version IDs for
 
 ---
 
+### `px dataset upload <file>`
+
+Create a dataset from a CSV, JSONL, JSON, or Arrow file. With `--append`, add
+the examples to the dataset named by `--name`, creating it if needed. The format
+is detected from the extension; use `--file-format` to override it. A `.json`
+file must contain an array of row objects, and an `.arrow` file must be in the
+Arrow IPC stream format.
+
+```bash
+px dataset upload examples.csv --name qa --input-keys question --output-keys answer
+px dataset upload more.jsonl --name qa --input-keys question --output-keys answer --append
+px dataset upload rows.json --name qa --input-keys question context --metadata-keys source --format raw --no-progress | jq .dataset_id
+```
+
+---
+
 ### `px dataset-versions list <dataset-identifier>`
 
 List all versions of a dataset by name or ID, newest first. The table shows each

@@ -1,5 +1,10 @@
 import * as fs from "fs";
-import type { componentsV1, PhoenixClient } from "@arizeai/phoenix-client";
+import * as path from "path";
+import {
+  type componentsV1,
+  HttpError,
+  type PhoenixClient,
+} from "@arizeai/phoenix-client";
 import { Command } from "commander";
 
 import { createPhoenixClient, resolveDatasetId } from "../client";
@@ -9,12 +14,18 @@ import {
   validateConfig,
 } from "../config";
 import { assertDeletesEnabled, confirmOrExit } from "../confirm";
-import { ExitCode, getExitCodeForError } from "../exitCodes";
+import {
+  AuthRequiredError,
+  ExitCode,
+  getExitCodeForError,
+  InvalidArgumentError,
+} from "../exitCodes";
 import { writeError, writeOutput, writeProgress } from "../io";
 import { collectString } from "../optionParsers";
 import {
   type DatasetExamplesData,
   formatDatasetExamplesOutput,
+  formatDatasetUploadOutput,
   type OutputFormat,
 } from "./formatDataset";
 import { formatDatasetsOutput } from "./formatDatasets";
@@ -60,6 +71,138 @@ interface DatasetListOptions extends CommonOptions<OutputFormat> {
    * @example 50
    */
   limit?: number;
+}
+
+const UPLOAD_FILE_FORMATS = ["csv", "jsonl", "json", "arrow"] as const;
+
+type UploadFileFormat = (typeof UPLOAD_FILE_FORMATS)[number];
+
+/**
+ * Content type the upload endpoint expects for each file format. JSON files
+ * are converted to JSONL before upload, so they share its content type.
+ */
+const UPLOAD_CONTENT_TYPES: Record<UploadFileFormat, string> = {
+  csv: "text/csv",
+  jsonl: "application/jsonl",
+  json: "application/jsonl",
+  arrow: "application/x-pandas-pyarrow",
+};
+
+/**
+ * Arrow IPC files start with these bytes; IPC streams, the only Arrow
+ * format the upload endpoint reads, do not.
+ */
+const ARROW_IPC_FILE_MAGIC = "ARROW1";
+
+/**
+ * Options for `px dataset upload <file>`.
+ */
+interface DatasetUploadOptions extends CommonOptions<OutputFormat> {
+  /**
+   * `--name <name>`: Name of the dataset to create, or to append to with
+   * `--append`.
+   *
+   * @example "support-questions"
+   */
+  name: string;
+  /**
+   * `--input-keys <columns...>`: Columns that make up each example's input.
+   *
+   * @example ["question", "context"]
+   */
+  inputKeys: string[];
+  /**
+   * `--output-keys <columns...>`: Columns that make up each example's
+   * expected output.
+   *
+   * @example ["answer"]
+   */
+  outputKeys?: string[];
+  /**
+   * `--metadata-keys <columns...>`: Columns stored as each example's
+   * metadata.
+   *
+   * @example ["source", "difficulty"]
+   */
+  metadataKeys?: string[];
+  /**
+   * `--split-key <column>`: Column whose values are each example's split
+   * name or a JSON list of split names.
+   *
+   * @example "split"
+   */
+  splitKey?: string;
+  /**
+   * `--file-format <format>`: Format of the file — `csv`, `jsonl`, `json`, or
+   * `arrow` — overriding detection from its extension.
+   *
+   * @example "jsonl"
+   */
+  fileFormat?: string;
+  /**
+   * `--append`: Add the examples to the dataset named by `--name`, creating
+   * it if needed. Without it, the upload fails if the name is taken.
+   *
+   * @example true
+   */
+  append?: boolean;
+}
+
+function isUploadFileFormat(value: string): value is UploadFileFormat {
+  return (UPLOAD_FILE_FORMATS as readonly string[]).includes(value);
+}
+
+/**
+ * Resolve the upload file format from `--file-format`, falling back to the
+ * file extension.
+ * @param params.filePath - path of the file being uploaded
+ * @param params.formatOverride - value of `--file-format`, if passed
+ */
+function resolveUploadFileFormat({
+  filePath,
+  formatOverride,
+}: {
+  filePath: string;
+  formatOverride?: string;
+}): UploadFileFormat {
+  const candidateFormat = (
+    formatOverride ?? path.extname(filePath).slice(1)
+  ).toLowerCase();
+  if (isUploadFileFormat(candidateFormat)) {
+    return candidateFormat;
+  }
+  const supportedFormats = UPLOAD_FILE_FORMATS.join(", ");
+  throw new InvalidArgumentError(
+    formatOverride === undefined
+      ? `Cannot detect the format of ${filePath} from its extension. Use --file-format with one of: ${supportedFormats}`
+      : `Unsupported --file-format "${formatOverride}". Use one of: ${supportedFormats}`
+  );
+}
+
+function isRowObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Convert a JSON file holding an array of row objects to JSONL, the line
+ * format the upload endpoint accepts.
+ */
+function convertJsonRowsToJsonl(fileContent: string): string {
+  let parsedContent: unknown;
+  try {
+    // JSON.parse rejects a leading byte order mark.
+    parsedContent = JSON.parse(fileContent.replace(/^\uFEFF/, ""));
+  } catch (error) {
+    throw new InvalidArgumentError(
+      `Invalid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!Array.isArray(parsedContent) || !parsedContent.every(isRowObject)) {
+    throw new InvalidArgumentError(
+      "A .json file must contain an array of row objects"
+    );
+  }
+  return parsedContent.map((row) => JSON.stringify(row)).join("\n");
 }
 
 /**
@@ -364,6 +507,127 @@ async function datasetDeleteHandler(
 }
 
 /**
+ * Handler for `dataset upload`
+ */
+async function datasetUploadHandler(
+  filePath: string,
+  options: DatasetUploadOptions
+): Promise<void> {
+  try {
+    const config = resolveConfig({
+      cliOptions: {
+        endpoint: options.endpoint,
+        apiKey: options.apiKey,
+      },
+    });
+
+    const validation = validateConfig({ config, projectRequired: false });
+    if (!validation.valid) {
+      writeError({
+        message: getConfigErrorMessage({ errors: validation.errors }),
+      });
+      process.exit(ExitCode.INVALID_ARGUMENT);
+    }
+
+    const fileStats = fs.statSync(filePath, { throwIfNoEntry: false });
+    if (!fileStats) {
+      throw new InvalidArgumentError(`File not found: ${filePath}`);
+    }
+    if (!fileStats.isFile()) {
+      throw new InvalidArgumentError(`Not a file: ${filePath}`);
+    }
+    const fileFormat = resolveUploadFileFormat({
+      filePath,
+      formatOverride: options.fileFormat,
+    });
+    const fileBytes = fs.readFileSync(filePath);
+    const isArrowIpcFile =
+      fileFormat === "arrow" &&
+      fileBytes.subarray(0, ARROW_IPC_FILE_MAGIC.length).toString("latin1") ===
+        ARROW_IPC_FILE_MAGIC;
+    if (isArrowIpcFile) {
+      throw new InvalidArgumentError(
+        `${filePath} is in the Arrow IPC file format, but the upload endpoint reads the Arrow IPC stream format. Write it with pyarrow.ipc.new_stream instead.`
+      );
+    }
+    const fileContent =
+      fileFormat === "json"
+        ? convertJsonRowsToJsonl(fileBytes.toString("utf-8"))
+        : fileBytes;
+
+    const formData = new FormData();
+    formData.append(
+      "file",
+      new Blob([fileContent], { type: UPLOAD_CONTENT_TYPES[fileFormat] }),
+      path.basename(filePath)
+    );
+    formData.append("action", options.append ? "append" : "create");
+    formData.append("name", options.name);
+    options.inputKeys.forEach((key) => formData.append("input_keys[]", key));
+    options.outputKeys?.forEach((key) => formData.append("output_keys[]", key));
+    options.metadataKeys?.forEach((key) =>
+      formData.append("metadata_keys[]", key)
+    );
+    if (options.splitKey) {
+      formData.append("split_key", options.splitKey);
+    }
+
+    const client = createPhoenixClient({ config });
+
+    writeProgress({
+      message: `Uploading ${filePath} (${fileFormat}) to dataset ${options.name}...`,
+      noProgress: !options.progress,
+    });
+
+    const response = await client
+      .POST("/v1/datasets/upload", {
+        params: { query: { sync: true } },
+        // FormData doesn't match the typed body shape; bodySerializer is what actually gets sent.
+        body: formData as never,
+        bodySerializer: () => formData,
+      })
+      .catch(async (error: unknown) => {
+        if (!(error instanceof HttpError)) {
+          throw error;
+        }
+        // The server explains rejected uploads (a taken name, an unknown
+        // column) in a plain-text body; the status line alone isn't actionable.
+        const errorDetail =
+          (await error.response.text().catch(() => "")).trim() || error.message;
+        if (error.status === 401 || error.status === 403) {
+          throw new AuthRequiredError(errorDetail);
+        }
+        if (error.status === 409) {
+          throw new InvalidArgumentError(
+            `${errorDetail} Pass --append to add to it, or choose another --name.`
+          );
+        }
+        if (error.status === 422) {
+          throw new InvalidArgumentError(errorDetail);
+        }
+        throw new Error(errorDetail);
+      });
+
+    if (!response.data) {
+      throw new Error("The server returned no upload result");
+    }
+
+    writeOutput({
+      message: formatDatasetUploadOutput({
+        data: response.data.data,
+        datasetName: options.name,
+        format: options.format,
+      }),
+    });
+  } catch (error) {
+    writeError({
+      message: `Error uploading dataset: ${error instanceof Error ? error.message : String(error)}`,
+    });
+    process.exit(getExitCodeForError(error));
+  }
+}
+
+/**
  * Create the `dataset get` command
  */
 export function createDatasetGetCommand(): Command {
@@ -422,6 +686,61 @@ export function createDatasetDeleteCommand(): Command {
 }
 
 /**
+ * Create the `dataset upload` command
+ */
+export function createDatasetUploadCommand(): Command {
+  return new Command("upload")
+    .description(
+      "Create a dataset, or append to one, from a CSV, JSONL, JSON, or Arrow file"
+    )
+    .argument("<file>", "Path to the file to upload")
+    .requiredOption("--name <name>", "Dataset name")
+    .requiredOption(
+      "--input-keys <columns...>",
+      "Columns to use as example inputs"
+    )
+    .option("--output-keys <columns...>", "Columns to use as example outputs")
+    .option(
+      "--metadata-keys <columns...>",
+      "Columns to store as example metadata"
+    )
+    .option(
+      "--split-key <column>",
+      "Column whose values are split names or JSON lists of split names"
+    )
+    .option(
+      "--file-format <format>",
+      "File format: csv, jsonl, json, or arrow (default: detected from the extension)"
+    )
+    .option(
+      "--append",
+      "Add to the dataset named by --name, creating it if needed"
+    )
+    .option("--endpoint <url>", "Phoenix API endpoint")
+    .option("--api-key <key>", "Phoenix API key for authentication")
+    .option(
+      "--format <format>",
+      "Output format: pretty, json, or raw",
+      "pretty"
+    )
+    .option("--no-progress", "Disable progress indicators")
+    .addHelpText(
+      "after",
+      [
+        "",
+        "A .json file must contain an array of row objects. An .arrow file must be",
+        "an Arrow IPC stream.",
+        "",
+        "Examples:",
+        "  px dataset upload examples.csv --name qa --input-keys question context --output-keys answer",
+        "  px dataset upload more.jsonl --name qa --input-keys question --output-keys answer --append",
+        "  px dataset upload rows.txt --name qa --input-keys question --file-format jsonl --format raw --no-progress",
+      ].join("\n")
+    )
+    .action(datasetUploadHandler);
+}
+
+/**
  * Create the `dataset` command with subcommands
  */
 export function createDatasetCommand(): Command {
@@ -429,6 +748,7 @@ export function createDatasetCommand(): Command {
   command.description("Manage Phoenix datasets");
   command.addCommand(createDatasetListCommand());
   command.addCommand(createDatasetGetCommand());
+  command.addCommand(createDatasetUploadCommand());
   command.addCommand(createDatasetDeleteCommand());
   return command;
 }

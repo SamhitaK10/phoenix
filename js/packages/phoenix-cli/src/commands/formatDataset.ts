@@ -5,6 +5,7 @@ import { formatTable } from "./formatTable";
 export type OutputFormat = "pretty" | "json" | "raw";
 
 type DatasetExample = componentsV1["schemas"]["DatasetExample"];
+type UploadDatasetData = componentsV1["schemas"]["UploadDatasetData"];
 
 export interface DatasetExamplesData {
   dataset_id: string;
@@ -76,6 +77,42 @@ function formatDatasetExamplesPretty(
   lines.push(formatTable(rows));
 
   return lines.join("\n").trimEnd();
+}
+
+export interface FormatDatasetUploadOutputOptions {
+  /**
+   * Result returned by the upload endpoint.
+   */
+  data: UploadDatasetData;
+  /**
+   * Dataset name (for display purposes).
+   */
+  datasetName: string;
+  /**
+   * Output format. Defaults to `"pretty"`.
+   */
+  format?: OutputFormat;
+}
+
+export function formatDatasetUploadOutput({
+  data,
+  datasetName,
+  format,
+}: FormatDatasetUploadOutputOptions): string {
+  const selected = format || "pretty";
+  if (selected === "raw") {
+    return JSON.stringify(data);
+  }
+  if (selected === "json") {
+    return JSON.stringify(data, null, 2);
+  }
+  return [
+    `Dataset: ${datasetName} (${data.dataset_id})`,
+    `Version: ${data.version_id}`,
+    `Examples created: ${data.num_created_examples}`,
+    `Examples updated: ${data.num_updated_examples}`,
+    `Examples deleted: ${data.num_deleted_examples}`,
+  ].join("\n");
 }
 
 function stringifyCompact(obj: unknown): string {

@@ -678,6 +678,31 @@ px dataset get query_response --format raw | jq '.examples[].input'
 | `--api-key <key>` | Phoenix API key | From env |
 | `--no-progress` | Disable progress indicators | — |
 
+### `px dataset upload <file>`
+
+Create a dataset from a CSV, JSONL, JSON, or Arrow file. With `--append`, add the examples to the dataset named by `--name`, and create it if needed. A `.json` file must contain an array of row objects. An `.arrow` file must be in the Arrow IPC stream format. The command prints the dataset ID, the version ID, and the number of examples created, updated, and deleted.
+
+```bash
+px dataset upload examples.csv --name qa --input-keys question --output-keys answer
+px dataset upload more.jsonl --name qa --input-keys question --output-keys answer --append
+px dataset upload rows.txt --name qa --input-keys question --file-format jsonl
+px dataset upload examples.csv --name qa --input-keys question --format raw --no-progress | jq .dataset_id
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--name <name>` | Dataset name (required) | — |
+| `--input-keys <columns...>` | Input columns (required) | — |
+| `--output-keys <columns...>` | Output columns | — |
+| `--metadata-keys <columns...>` | Metadata columns | — |
+| `--split-key <column>` | Column whose values are split names or JSON lists of split names | — |
+| `--file-format <format>` | `csv`, `jsonl`, `json`, or `arrow` | From extension |
+| `--append` | Add to the dataset named by `--name`, and create it if needed | — |
+| `--format <format>` | `pretty`, `json`, or `raw` | `pretty` |
+| `--endpoint <url>` | Phoenix API endpoint | From env |
+| `--api-key <key>` | Phoenix API key | From env |
+| `--no-progress` | Disable progress indicators | — |
+
 ### `px experiment list --dataset <name-or-id>`
 
 List experiments for a dataset, optionally exporting full data to files.
